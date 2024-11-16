@@ -20,6 +20,7 @@
 
 #include "anim/animatable.h"
 #include "bling.h"
+#include "cursor.h"
 #include "cutouts-overlay.h"
 #include "settings.h"
 #include "layer-shell.h"
@@ -392,6 +393,9 @@ scan_out_fullscreen_view (PhocOutput *self, PhocView *view, struct wlr_output_st
     if (phoc_drag_icon_is_mapped (drag_icon))
       return false;
   }
+
+  if (phoc_output_has_shell_revealed (self))
+    return false;
 
   if (phoc_output_has_layer (self, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY))
     return false;
@@ -901,7 +905,7 @@ phoc_output_initable_init (GInitable    *initable,
 
     g_assert (PHOC_IS_SEAT (seat));
     phoc_seat_configure_cursor (seat);
-    phoc_seat_configure_xcursor (seat);
+    phoc_cursor_configure_xcursor (seat->cursor);
   }
 
   phoc_layer_shell_arrange (self);
@@ -1165,7 +1169,7 @@ phoc_output_xwayland_children_for_each_surface (PhocOutput                  *sel
   struct wlr_xwayland_surface *child;
 
   wl_list_for_each (child, &surface->children, parent_link) {
-    if (child->surface->mapped) {
+    if (child->surface && child->surface->mapped) {
       double ox = child->x - output_box.x;
       double oy = child->y - output_box.y;
       phoc_output_surface_for_each_surface (self, child->surface, ox, oy, iterator,
@@ -1305,11 +1309,13 @@ phoc_output_get_layer_surfaces_for_layer (PhocOutput *self, enum zwlr_layer_shel
     if (!target)
       continue;
 
-    if (phoc_layer_surface_get_output (stacked) != self)
+    if (phoc_layer_surface_get_output (target) != self)
       continue;
 
     if (phoc_layer_surface_get_layer (target) != phoc_layer_surface_get_layer (stacked)) {
-      g_critical ("Stacked surface and target surface not in same layer");
+      g_critical ("Stacked surface %s and target %s surface not in same layer",
+                  phoc_layer_surface_get_namespace (stacked),
+                  phoc_layer_surface_get_namespace (target));
       continue;
     }
 
