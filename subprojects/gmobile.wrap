@@ -1,5 +1,5 @@
 [wrap-git]
 directory=gmobile
-url=https://gitlab.gnome.org/World/Phosh/gmobile.git
-revision=v0.1.0
+url=https://github.com/FuriLabs/gmobile.git
+revision=droidian/trixie/0.2.0+furios0
 depth=1
