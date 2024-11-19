@@ -1583,6 +1583,7 @@ phoc_cursor_handle_touch_up (PhocCursor                *self,
     wlr_seat_touch_get_point (self->seat->seat, event->touch_id);
   PhocTouchPoint *touch_point;
   PhocCursorPrivate *priv;
+  struct wlr_surface *surface = point ? point->surface : NULL;
 
   g_assert (PHOC_IS_CURSOR (self));
   priv = phoc_cursor_get_instance_private (self);
@@ -1612,7 +1613,7 @@ phoc_cursor_handle_touch_up (PhocCursor                *self,
     phoc_cursor_update_focus (self);
   }
 
-  send_touch_up (self->seat, point->surface, event);
+  send_touch_up (self->seat, surface, event);
 }
 
 
