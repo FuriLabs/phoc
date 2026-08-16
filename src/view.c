@@ -2215,3 +2215,38 @@ phoc_view_is_always_on_top (PhocView *self)
 
   return priv->always_on_top;
 }
+
+
+/**
+ * phoc_view_wants_blur:
+ * @self: a view
+ *
+ * Whether there is any point blurring what is behind this view.
+ *
+ * wlroots sets a surface's opaque region to the whole surface when its buffer
+ * format has no alpha, so a window that claims no opaque pixels at all is
+ * telling us it is translucent and that what is behind it will show through.
+ * That is the set of windows worth blurring behind, and it needs no per-app
+ * configuration: give an app a translucent theme and it gets frosted.
+ *
+ * The test is deliberately "opaque region is empty" rather than "opaque region
+ * does not cover the surface". A window with rounded corners or a cutout
+ * reports an opaque region a few pixels short of its own extent while being
+ * opaque everywhere it actually paints, and the weaker test would put a
+ * full blur pass behind it that nothing can ever see.
+ *
+ * Returns: %TRUE if the view's backdrop is worth blurring
+ */
+gboolean
+phoc_view_wants_blur (PhocView *self)
+{
+  struct wlr_surface *surface;
+
+  g_assert (PHOC_IS_VIEW (self));
+
+  surface = self->wlr_surface;
+  if (surface == NULL || surface->current.width <= 0 || surface->current.height <= 0)
+    return FALSE;
+
+  return !pixman_region32_not_empty (&surface->opaque_region);
+}
