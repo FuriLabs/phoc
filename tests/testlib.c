@@ -328,6 +328,9 @@ static void registry_handle_global(void *data, struct wl_registry *registry,
   } else if (!g_strcmp0 (interface, zphoc_layer_shell_effects_v1_interface.name)) {
     globals->layer_shell_effects = wl_registry_bind (registry, name,
                                                      &zphoc_layer_shell_effects_v1_interface, 3);
+  } else if (!g_strcmp0 (interface, zphoc_furios_layer_shell_effects_v1_interface.name)) {
+    globals->furios_layer_shell_effects =
+      wl_registry_bind (registry, name, &zphoc_furios_layer_shell_effects_v1_interface, 1);
   } else if (!g_strcmp0 (interface, zxdg_decoration_manager_v1_interface.name)) {
     globals->decoration_manager = wl_registry_bind (registry, name,
                                                      &zxdg_decoration_manager_v1_interface, 1);
@@ -377,6 +380,8 @@ wl_client_run (GTask *task, gpointer source,
   wl_proxy_destroy ((struct wl_proxy *)globals.phosh);
   g_clear_pointer (&globals.foreign_toplevel_manager, zwlr_foreign_toplevel_manager_v1_destroy);
   g_clear_pointer (&globals.screencopy_manager, zwlr_screencopy_manager_v1_destroy);
+  g_clear_pointer (&globals.furios_layer_shell_effects,
+                   zphoc_furios_layer_shell_effects_v1_destroy);
   g_clear_pointer (&globals.layer_shell_effects, zphoc_layer_shell_effects_v1_destroy);
   g_clear_pointer (&globals.layer_shell, zwlr_layer_shell_v1_destroy);
   wl_proxy_destroy ((struct wl_proxy *)globals.xdg_shell);
@@ -967,8 +972,16 @@ phoc_test_setup (PhocTestFixture *fixture, gconstpointer data)
   g_assert_no_error (err);
 
   g_setenv ("XDG_RUNTIME_DIR", fixture->tmpdir, TRUE);
-  g_setenv ("DISPLAY", display, TRUE);
-  g_setenv ("WLR_BACKENDS", "x11", TRUE);
+  /* Without xvfb-run there is no DISPLAY to preserve, and g_setenv() asserts
+   * on a NULL value rather than telling you what is wrong */
+  if (display != NULL)
+    g_setenv ("DISPLAY", display, TRUE);
+  /* Default to the x11 backend, but let the caller pick another one. Running
+   * nested against a real wayland session is the only way to exercise code
+   * paths that need a GPU renderer, since the x11 test setup only ever gets
+   * the pixman one. */
+  if (g_getenv ("WLR_BACKENDS") == NULL)
+    g_setenv ("WLR_BACKENDS", "x11", TRUE);
 }
 
 static void
