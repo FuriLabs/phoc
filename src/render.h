@@ -48,6 +48,8 @@ void          phoc_renderer_render_output (PhocRenderer      *self,
 gboolean      phoc_renderer_render_view_to_buffer (PhocRenderer           *self,
                                                    PhocView               *view,
                                                    struct wlr_buffer      *data);
+void          phoc_renderer_set_blur_enabled      (PhocRenderer           *self,
+                                                   gboolean                enabled);
 gboolean      phoc_renderer_get_blur_enabled      (PhocRenderer           *self);
 void          phoc_renderer_finish_frame          (PhocRenderer           *self);
 void          phoc_renderer_forget_output         (PhocRenderer           *self,
