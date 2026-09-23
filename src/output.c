@@ -444,6 +444,42 @@ scan_out_fullscreen_view (PhocOutput *self, PhocView *view, struct wlr_output_st
 }
 
 
+/*
+ * The largest blur radius asked for on this output.
+ *
+ * Walked once a frame by phoc_output_draw() and handed to the renderer, which
+ * would otherwise rediscover it for every surface it draws.
+ *
+ * Returns: the radius, 0 when nothing on this output is blurred
+ */
+static guint
+phoc_output_get_blur_radius (PhocOutput *self)
+{
+  guint radius = 0;
+  static const enum zwlr_layer_shell_v1_layer layers[] = {
+    ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+    ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+  };
+
+  g_assert (PHOC_IS_OUTPUT (self));
+
+  for (guint i = 0; i < G_N_ELEMENTS (layers); i++) {
+    GQueue *layer_surfaces = phoc_output_get_layer_surfaces_for_layer (self, layers[i]);
+
+    for (GList *l = layer_surfaces->head; l; l = l->next) {
+      PhocLayerSurface *layer_surface = PHOC_LAYER_SURFACE (l->data);
+
+      if (!layer_surface->mapped)
+        continue;
+
+      radius = MAX (radius, phoc_layer_surface_get_blur (layer_surface));
+    }
+  }
+
+  return radius;
+}
+
+
 static void
 get_frame_damage (PhocOutput *self, pixman_region32_t *frame_damage)
 {
@@ -478,6 +514,7 @@ phoc_output_draw (PhocOutput *self)
   struct wlr_buffer *buffer;
   struct wlr_render_pass *render_pass;
   struct wlr_output_state pending = { 0 };
+  guint blur_radius = 0;
 
   if (!wlr_output->enabled)
     return;
@@ -491,6 +528,32 @@ phoc_output_draw (PhocOutput *self)
 
   if (G_UNLIKELY (priv->gamma_lut_changed))
     phoc_output_set_gamma_lut (self, &pending);
+
+  /*
+   * A blurred backdrop is a pyramid over a copy of the whole scene below it,
+   * and its coarse levels are a sixty-fourth of the output, so one of their
+   * texels is sixty-four pixels wide: a blurred pixel is a weighted sum of
+   * content from hundreds of pixels away, recomputed over the whole capture
+   * every frame.
+   *
+   * That is why any damage invalidates all of it, and why the whole output is
+   * repainted rather than the damage alone. Repainting only around the damage
+   * recomputes the pyramid from a capture whose other parts were taken at a
+   * different time -- the repainted patch then does not match what surrounds
+   * it -- and leaves the rest of the framebuffer holding the previous frame's
+   * composite, blurred surface included, which the pyramid would feed back
+   * into itself.
+   *
+   * The cost is real and it is bounded by asking first: with the blur
+   * gsetting off, or a renderer that cannot draw it, or nothing on the output
+   * asking for it, nothing is promoted. An idle screen damages nothing and so
+   * renders nothing at all.
+   */
+  if (phoc_renderer_get_blur_enabled (priv->renderer))
+    blur_radius = phoc_output_get_blur_radius (self);
+
+  if (blur_radius > 0 && pixman_region32_not_empty (&self->damage_ring.current))
+    wlr_damage_ring_add_whole (&self->damage_ring);
 
   pending.committed |= WLR_OUTPUT_STATE_DAMAGE;
   get_frame_damage (self, &pending.damage);
@@ -512,20 +575,22 @@ phoc_output_draw (PhocOutput *self)
   if (wlr_renderer_is_android(wlr_output->renderer))
     buffer_age = wlr_renderer_get_buffer_age (wlr_output->renderer, buffer);
 
+  pixman_region32_init (&buffer_damage);
+  wlr_damage_ring_get_buffer_damage (&self->damage_ring, buffer_age, &buffer_damage);
+
   render_pass = wlr_renderer_begin_buffer_pass_for_output (wlr_output->renderer, buffer, NULL, (void*)wlr_output);
   if (!render_pass) {
+    pixman_region32_fini (&buffer_damage);
     wlr_buffer_unlock (buffer);
     goto out;
   }
-
-  pixman_region32_init (&buffer_damage);
-  wlr_damage_ring_get_buffer_damage (&self->damage_ring, buffer_age, &buffer_damage);
 
   render_context = (PhocRenderContext){
     .output = self,
     .damage = &buffer_damage,
     .alpha = 1.0,
     .render_pass = render_pass,
+    .blur_radius = blur_radius,
   };
   phoc_renderer_render_output (priv->renderer, self, &render_context);
 
@@ -545,6 +610,7 @@ phoc_output_draw (PhocOutput *self)
   wlr_damage_ring_rotate (&self->damage_ring);
 
  out:
+  phoc_renderer_finish_frame (priv->renderer);
   wlr_output_state_finish (&pending);
 }
 
@@ -959,6 +1025,9 @@ phoc_output_finalize (GObject *object)
 {
   PhocOutput *self = PHOC_OUTPUT (object);
   PhocOutputPrivate *priv = phoc_output_get_instance_private (self);
+
+  if (priv->renderer)
+    phoc_renderer_forget_output (priv->renderer, self);
 
   self->wlr_output->data = NULL;
   self->wlr_output = NULL;

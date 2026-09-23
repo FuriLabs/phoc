@@ -212,5 +212,6 @@ void                  phoc_view_add_bling (PhocView *self, PhocBling *bling);
 void                  phoc_view_remove_bling (PhocView *self, PhocBling *bling);
 GSList               *phoc_view_get_blings (PhocView *self);
 void                  phoc_view_add_child (PhocView *self, PhocViewChild *child);
+gboolean              phoc_view_wants_blur (PhocView *self);
 
 G_END_DECLS
