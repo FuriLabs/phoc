@@ -78,6 +78,15 @@ static GParamSpec *props[PROP_LAST_PROP];
  * further level halves the resolution again and roughly doubles the reach. */
 #define PHOC_BLUR_MAX_LEVELS 5
 
+/* What a cached backdrop is a blurred picture of. The wallpaper is the
+ * background layer; the overlay source is whatever an overlay surface sits
+ * on, which for the lock screen is its own background surface. */
+typedef enum {
+  PHOC_BLUR_SOURCE_WALLPAPER,
+  PHOC_BLUR_SOURCE_OVERLAY,
+  PHOC_BLUR_N_SOURCES,
+} PhocBlurSource;
+
 /* Blur resources are plain GL textures and FBOs on purpose: the android
  * renderer used on Halium devices has neither dmabuf import nor a native
  * window for offscreen buffers, so wlr_allocator buffers cannot be bound as
@@ -92,6 +101,18 @@ typedef struct _PhocBlurState {
   GLuint tex[PHOC_BLUR_MAX_LEVELS];
   GLuint fbo[PHOC_BLUR_MAX_LEVELS];
   int    w[PHOC_BLUR_MAX_LEVELS], h[PHOC_BLUR_MAX_LEVELS];
+  /* The cached backdrops, one per source, each level 0 sized. A cache is
+   * redrawn only when its source changes, not when anything on screen does. */
+  GLuint cache[PHOC_BLUR_N_SOURCES];
+  GLuint cache_fbo[PHOC_BLUR_N_SOURCES];
+  /* Whether a cache holds a picture at all, and whether its source has
+   * changed since. A stale picture still beats none when the source cannot
+   * be redrawn this frame, e.g. the wallpaper under a fullscreen app. */
+  gboolean cache_filled[PHOC_BLUR_N_SOURCES];
+  gboolean cache_dirty[PHOC_BLUR_N_SOURCES];
+  /* What each cache was made with; a change in either makes it stale */
+  guint  cache_radius[PHOC_BLUR_N_SOURCES];
+  struct wlr_box cache_usable[PHOC_BLUR_N_SOURCES];
 } PhocBlurState;
 
 
@@ -284,9 +305,6 @@ render_surface_iterator (PhocOutput         *output,
   if (!texture)
     return;
 
-  /* Anything drawn invalidates a blur capture taken before it */
-  ctx->blur_stale = TRUE;
-
   struct wlr_fbox src_box;
   wlr_surface_get_buffer_source_box (surface, &src_box);
 
@@ -328,10 +346,16 @@ render_blings (PhocOutput *output, PhocView *view, PhocRenderContext *ctx)
 }
 
 
-static void     render_blur_backdrop_box  (struct wlr_box geo, PhocRenderContext *ctx);
+static void     render_blur_backdrop_box  (struct wlr_box     geo,
+                                           GLuint             texture,
+                                           PhocRenderContext *ctx);
 static void     phoc_renderer_capture_blur (PhocRenderer      *self,
                                             PhocOutput        *output,
-                                            PhocRenderContext *ctx);
+                                            PhocRenderContext *ctx,
+                                            PhocBlurSource     source);
+static GLuint   blur_backdrop_get          (PhocRenderContext *ctx,
+                                            PhocBlurSource     source);
+static void     blur_mark_all_dirty        (PhocRenderer      *self);
 
 static void
 render_view (PhocOutput *output, PhocView *view, PhocRenderContext *ctx)
@@ -355,11 +379,7 @@ render_view (PhocOutput *output, PhocView *view, PhocRenderContext *ctx)
     geo.x -= output->lx;
     geo.y -= output->ly;
 
-    if (ctx->blur_texture == 0 || ctx->blur_stale)
-      phoc_renderer_capture_blur (ctx->renderer, output, ctx);
-
-    if (ctx->blur_texture)
-      render_blur_backdrop_box (geo, ctx);
+    render_blur_backdrop_box (geo, blur_backdrop_get (ctx, PHOC_BLUR_SOURCE_WALLPAPER), ctx);
   }
 
   phoc_output_view_for_each_surface (output, view, render_surface_iterator, ctx);
@@ -368,88 +388,81 @@ render_view (PhocOutput *output, PhocView *view, PhocRenderContext *ctx)
 
 
 /*
- * Draw the blurred backdrop behind a blur enabled layer surface. The
- * backdrop texture covers the whole output in buffer coordinates so
- * we sample the region matching the surface's geometry.
+ * Draw a blurred backdrop behind a surface. The backdrop texture covers the
+ * whole output in buffer coordinates, so we sample the region matching the
+ * surface's geometry.
+ *
+ * Only the damaged part is drawn, clipped the way wlroots clips its own draws:
+ * one quad per damage rectangle, no scissor. Outside the damage the
+ * framebuffer still holds last frame's backdrop with the surface over it, and
+ * drawing the bare backdrop there would erase the surface. That only works
+ * because a cached backdrop is the same picture every frame.
+ *
+ * No GL state is queried or restored here. Every wlroots draw sets its own
+ * program, texture and blend state, and nothing here changes the framebuffer
+ * or viewport, so there is nothing to hand back.
  */
 static void
-render_blur_backdrop_box (struct wlr_box geo, PhocRenderContext *ctx)
+render_blur_backdrop_box (struct wlr_box geo, GLuint texture, PhocRenderContext *ctx)
 {
   PhocOutput *output = ctx->output;
   struct wlr_output *wlr_output = output->wlr_output;
   PhocRenderer *self = ctx->renderer;
   struct wlr_box dst;
-  float pos[8], uv[8];
-  float x0, x1, y0, y1;
+  pixman_region32_t region;
+  const pixman_box32_t *rects;
+  int nrects;
   int ow = wlr_output->width, oh = wlr_output->height;
-  GLint prev_abuf = 0;
-  GLboolean prev_blend, prev_scissor;
 
-  if (self == NULL || ow <= 0 || oh <= 0)
+  if (self == NULL || texture == 0 || ow <= 0 || oh <= 0)
     return;
 
   dst = geo;
   phoc_utils_scale_box (&dst, wlr_output->scale);
   phoc_output_transform_box (output, &dst);
 
-  /* A surface may extend past the output, keep the quad on screen */
-  if (dst.x < 0) {
-    dst.width += dst.x;
-    dst.x = 0;
+  pixman_region32_init_rect (&region, dst.x, dst.y, dst.width, dst.height);
+  /* A surface may extend past the output, keep the quads on screen */
+  pixman_region32_intersect_rect (&region, &region, 0, 0, ow, oh);
+  if (ctx->buffer_damage)
+    pixman_region32_intersect (&region, &region, ctx->buffer_damage);
+
+  rects = pixman_region32_rectangles (&region, &nrects);
+  if (nrects > 0) {
+    glBindBuffer (GL_ARRAY_BUFFER, 0);
+    glDisable (GL_BLEND);
+    glDisable (GL_SCISSOR_TEST);
   }
-  if (dst.y < 0) {
-    dst.height += dst.y;
-    dst.y = 0;
+
+  for (int i = 0; i < nrects; i++) {
+    float pos[8], uv[8];
+    /* Buffer coordinates are top left based, GL's are bottom left based */
+    float x0 = 2.0f * rects[i].x1 / ow - 1.0f;
+    float x1 = 2.0f * rects[i].x2 / ow - 1.0f;
+    float y0 = 1.0f - 2.0f * rects[i].y2 / oh;
+    float y1 = 1.0f - 2.0f * rects[i].y1 / oh;
+
+    pos[0] = x0; pos[1] = y0;
+    pos[2] = x1; pos[3] = y0;
+    pos[4] = x0; pos[5] = y1;
+    pos[6] = x1; pos[7] = y1;
+
+    /* Sample exactly the pixels covered, so the backdrop lines up with what
+     * is behind it rather than sliding around as the surface moves */
+    for (int j = 0; j < 8; j++)
+      uv[j] = pos[j] * 0.5f + 0.5f;
+
+    blur_draw_quad (&self->blur_up, texture, pos, uv, 0.0f, 0.0f, NULL);
   }
-  dst.width = MIN (dst.width, ow - dst.x);
-  dst.height = MIN (dst.height, oh - dst.y);
-  if (dst.width <= 0 || dst.height <= 0)
-    return;
 
-  /* Buffer coordinates are top left based, GL's are bottom left based */
-  x0 = 2.0f * dst.x / ow - 1.0f;
-  x1 = 2.0f * (dst.x + dst.width) / ow - 1.0f;
-  y0 = 1.0f - 2.0f * (dst.y + dst.height) / oh;
-  y1 = 1.0f - 2.0f * dst.y / oh;
-
-  pos[0] = x0; pos[1] = y0;
-  pos[2] = x1; pos[3] = y0;
-  pos[4] = x0; pos[5] = y1;
-  pos[6] = x1; pos[7] = y1;
-
-  /* Sample exactly the pixels the surface covers, so the backdrop lines up
-   * with what is behind it rather than sliding around as the surface moves */
-  for (int i = 0; i < 8; i++)
-    uv[i] = pos[i] * 0.5f + 0.5f;
-
-  glGetIntegerv (GL_ARRAY_BUFFER_BINDING, &prev_abuf);
-  prev_blend = glIsEnabled (GL_BLEND);
-  prev_scissor = glIsEnabled (GL_SCISSOR_TEST);
-
-  /* The backdrop replaces what is underneath, the surface itself blends over
-   * it afterwards. The whole output is damaged whenever a blur is drawn, so no
-   * scissoring is needed here. */
-  glBindBuffer (GL_ARRAY_BUFFER, 0);
-  glDisable (GL_BLEND);
-  glDisable (GL_SCISSOR_TEST);
-
-  blur_draw_quad (&self->blur_up, ctx->blur_texture, pos, uv, 0.0f, 0.0f, NULL);
-
-  glBindBuffer (GL_ARRAY_BUFFER, prev_abuf);
-  if (prev_blend)
-    glEnable (GL_BLEND);
-  if (prev_scissor)
-    glEnable (GL_SCISSOR_TEST);
-  glUseProgram (0);
-  glBindTexture (GL_TEXTURE_2D, 0);
-  glActiveTexture (GL_TEXTURE0);
+  pixman_region32_fini (&region);
 }
 
 
 static void
-render_blur_backdrop (PhocLayerSurface *layer_surface, PhocRenderContext *ctx)
+render_blur_backdrop (PhocLayerSurface *layer_surface, GLuint texture, PhocRenderContext *ctx)
 {
-  render_blur_backdrop_box (layer_surface->geo, ctx);
+  render_blur_backdrop_box (layer_surface->geo, texture, ctx);
 }
 
 
@@ -457,22 +470,23 @@ static void
 render_layer (enum zwlr_layer_shell_v1_layer layer, PhocRenderContext *ctx)
 {
   GQueue *layer_surfaces = phoc_output_get_layer_surfaces_for_layer (ctx->output, layer);
+  gboolean covers_something = FALSE;
 
   for (GList *l = layer_surfaces->head; l; l = l->next) {
     PhocLayerSurface *layer_surface = PHOC_LAYER_SURFACE (l->data);
 
     if (layer_surface->mapped && phoc_layer_surface_get_blur (layer_surface) > 0) {
-      /* Capture per blurred surface, not once per frame: a blurred surface has
-       * to sample everything beneath it, including surfaces drawn earlier in
-       * its own layer. The lock screen is exactly that case -- it sits above
-       * its own background surface, and a frame-level capture would hand it
-       * the apps underneath instead of the wallpaper it is covering. The stale
-       * flag keeps this to one capture when nothing was drawn in between. */
-      if (ctx->blur_texture == 0 || ctx->blur_stale)
-        phoc_renderer_capture_blur (ctx->renderer, ctx->output, ctx);
+      /* An overlay surface drawn over another one frosts that, not the
+       * wallpaper. The lock screen is exactly that case -- it sits above its
+       * own background surface. Everything else frosts the wallpaper. */
+      PhocBlurSource source = PHOC_BLUR_SOURCE_WALLPAPER;
 
-      if (ctx->blur_texture)
-        render_blur_backdrop (layer_surface, ctx);
+      if (layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY && covers_something)
+        source = PHOC_BLUR_SOURCE_OVERLAY;
+
+      render_blur_backdrop (layer_surface, blur_backdrop_get (ctx, source), ctx);
+    } else if (layer_surface->mapped) {
+      covers_something = TRUE;
     }
 
     ctx->alpha = phoc_layer_surface_get_alpha (layer_surface);
@@ -846,6 +860,12 @@ blur_state_free (PhocBlurState *state)
       if (state->tex[i])
         glDeleteTextures (1, &state->tex[i]);
     }
+    for (int i = 0; i < PHOC_BLUR_N_SOURCES; i++) {
+      if (state->cache_fbo[i])
+        glDeleteFramebuffers (1, &state->cache_fbo[i]);
+      if (state->cache[i])
+        glDeleteTextures (1, &state->cache[i]);
+    }
     if (state->capture)
       glDeleteTextures (1, &state->capture);
   }
@@ -1061,6 +1081,7 @@ phoc_renderer_set_blur_enabled (PhocRenderer *self, gboolean enabled)
   g_return_if_fail (PHOC_IS_RENDERER (self));
 
   self->blur_enabled = enabled;
+  blur_mark_all_dirty (self);
 }
 
 
@@ -1135,6 +1156,24 @@ blur_state_get (PhocRenderer *self, PhocOutput *output)
     }
   }
 
+  for (int i = 0; i < PHOC_BLUR_N_SOURCES; i++) {
+    state->cache[i] = blur_texture_new (state->w[0], state->h[0]);
+
+    glGenFramebuffers (1, &state->cache_fbo[i]);
+    glBindFramebuffer (GL_FRAMEBUFFER, state->cache_fbo[i]);
+    glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                            GL_TEXTURE_2D, state->cache[i], 0);
+
+    if (glCheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+      g_warning ("Incomplete blur cache framebuffer %dx%d, disabling blur",
+                 state->w[0], state->h[0]);
+      blur_state_free (state);
+      self->blur_state_failed = TRUE;
+      glBindFramebuffer (GL_FRAMEBUFFER, prev_fbo);
+      return NULL;
+    }
+  }
+
   g_message ("Blur enabled on output '%s': %dx%d backdrop at %dx%d, %d pyramid levels",
              wlr_output->name, state->width, state->height, state->bw, state->bh,
              PHOC_BLUR_MAX_LEVELS);
@@ -1201,10 +1240,11 @@ blur_levels (guint radius)
  * phoc_renderer_capture_blur:
  * @self: The renderer
  * @output: The output being rendered
- * @ctx:(inout): The render context
+ * @ctx: The render context
  *
  * Copy back what has been rendered into the output's framebuffer so far, blur
- * it, and store the result in @ctx for [func@render_blur_backdrop].
+ * it, and store the result in @source's cache for [func@render_blur_backdrop],
+ * where it is kept until the source changes.
  *
  * Must be called from inside the output's render pass, after everything the
  * blur should pick up has been drawn and before the first blurred surface.
@@ -1213,7 +1253,10 @@ blur_levels (guint radius)
  * is rendered once per frame rather than twice.
  */
 static void
-phoc_renderer_capture_blur (PhocRenderer *self, PhocOutput *output, PhocRenderContext *ctx)
+phoc_renderer_capture_blur (PhocRenderer      *self,
+                            PhocOutput        *output,
+                            PhocRenderContext *ctx,
+                            PhocBlurSource     source)
 {
   PhocBlurState *state;
   struct wlr_output *wlr_output = output->wlr_output;
@@ -1225,9 +1268,6 @@ phoc_renderer_capture_blur (PhocRenderer *self, PhocOutput *output, PhocRenderCo
   int slop, margin;
   GLint prev_fbo = 0, prev_abuf = 0;
   GLboolean prev_blend, prev_scissor;
-
-  ctx->blur_texture = 0;
-  ctx->blur_stale = FALSE;
 
   radius = ctx->blur_radius;
   if (radius == 0)
@@ -1349,9 +1389,11 @@ phoc_renderer_capture_blur (PhocRenderer *self, PhocOutput *output, PhocRenderCo
 
   /* Downscale the full res capture into the base of the pyramid. This one step
    * is a 4x reduction, so its taps sit half a base texel out, i.e. two capture
-   * texels, which covers the footprint being discarded. */
+   * texels, which covers the footprint being discarded. A cached backdrop is
+   * written straight into its cache by whichever pass comes last. */
   glViewport (0, 0, state->w[0], state->h[0]);
-  glBindFramebuffer (GL_FRAMEBUFFER, state->fbo[0]);
+  glBindFramebuffer (GL_FRAMEBUFFER,
+                     levels == 0 ? state->cache_fbo[source] : state->fbo[0]);
   blur_draw_quad (&self->blur_down, state->capture, blur_quad_pos, blur_quad_uv,
                   0.5f / state->w[0], 0.5f / state->h[0], psrect);
 
@@ -1367,12 +1409,16 @@ phoc_renderer_capture_blur (PhocRenderer *self, PhocOutput *output, PhocRenderCo
    * so the levels double as their own ping-pong buffers. */
   for (int i = levels; i > 0; i--) {
     glViewport (0, 0, state->w[i - 1], state->h[i - 1]);
-    glBindFramebuffer (GL_FRAMEBUFFER, state->fbo[i - 1]);
+    glBindFramebuffer (GL_FRAMEBUFFER,
+                       i == 1 ? state->cache_fbo[source] : state->fbo[i - 1]);
     blur_draw_quad (&self->blur_up, state->tex[i], blur_quad_pos, blur_quad_uv,
                     0.5f / state->w[i - 1], 0.5f / state->h[i - 1], NULL);
   }
 
-  ctx->blur_texture = state->tex[0];
+  state->cache_filled[source] = TRUE;
+  state->cache_dirty[source] = FALSE;
+  state->cache_radius[source] = radius;
+  state->cache_usable[source] = output->usable_area;
 
   /* Hand the GL state back the way the wlroots render pass left it */
   glBindFramebuffer (GL_FRAMEBUFFER, prev_fbo);
@@ -1385,6 +1431,220 @@ phoc_renderer_capture_blur (PhocRenderer *self, PhocOutput *output, PhocRenderCo
   glUseProgram (0);
   glBindTexture (GL_TEXTURE_2D, 0);
   glActiveTexture (GL_TEXTURE0);
+}
+
+
+/* Whether @source's cache can be drawn as it is */
+static gboolean
+blur_cache_current (PhocBlurState *state, PhocOutput *output, PhocBlurSource source, guint radius)
+{
+  return state->cache_filled[source] &&
+         !state->cache_dirty[source] &&
+         state->cache_radius[source] == radius &&
+         memcmp (&state->cache_usable[source], &output->usable_area, sizeof (struct wlr_box)) == 0;
+}
+
+
+/*
+ * Whether an overlay surface frosts what is under it in the overlay layer
+ * rather than the wallpaper, i.e. whether the overlay cache is in use. Mirrors
+ * the choice render_layer() makes.
+ */
+static gboolean
+blur_overlay_source_needed (PhocOutput *output)
+{
+  GQueue *layer_surfaces = phoc_output_get_layer_surfaces_for_layer (output,
+                                                                     ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY);
+  gboolean covers_something = FALSE;
+
+  for (GList *l = layer_surfaces->head; l; l = l->next) {
+    PhocLayerSurface *layer_surface = PHOC_LAYER_SURFACE (l->data);
+
+    if (!layer_surface->mapped)
+      continue;
+
+    if (phoc_layer_surface_get_blur (layer_surface) > 0)
+      return covers_something;
+
+    covers_something = TRUE;
+  }
+
+  return FALSE;
+}
+
+
+/*
+ * A cache may only be captured in a frame that repaints the whole output:
+ * anywhere outside the damage the framebuffer still holds last frame's
+ * composite, blurred surfaces included. The output promotes its damage to
+ * whole whenever a cache it needs is stale (phoc_renderer_blur_wants_whole_frame),
+ * so this is a guard rather than the mechanism.
+ */
+static gboolean
+blur_frame_is_whole (PhocRenderContext *ctx)
+{
+  struct wlr_output *wlr_output = ctx->output->wlr_output;
+  pixman_box32_t box = { 0, 0, wlr_output->width, wlr_output->height };
+
+  return ctx->buffer_damage &&
+         pixman_region32_contains_rectangle (ctx->buffer_damage, &box) == PIXMAN_REGION_IN;
+}
+
+
+/* Redraw @source's cache from the framebuffer if it is stale and can be */
+static void
+blur_cache_refresh (PhocRenderContext *ctx, PhocBlurSource source)
+{
+  PhocRenderer *self = ctx->renderer;
+  PhocBlurState *state;
+
+  if (ctx->blur_radius == 0)
+    return;
+
+  state = g_hash_table_lookup (self->blur_states, ctx->output);
+  if (state && blur_cache_current (state, ctx->output, source, ctx->blur_radius))
+    return;
+
+  if (!blur_frame_is_whole (ctx))
+    return;
+
+  phoc_renderer_capture_blur (self, ctx->output, ctx, source);
+}
+
+
+/*
+ * The backdrop texture to draw behind a blurred surface: @source's cache.
+ * 0 when there is nothing to draw.
+ */
+static GLuint
+blur_backdrop_get (PhocRenderContext *ctx, PhocBlurSource source)
+{
+  PhocRenderer *self = ctx->renderer;
+  PhocBlurState *state;
+
+  /* The wallpaper is captured once its layer is drawn, in
+   * phoc_renderer_render_output(). The overlay source can only be captured
+   * here, at the point in the overlay layer where it is complete. */
+  if (source == PHOC_BLUR_SOURCE_OVERLAY)
+    blur_cache_refresh (ctx, source);
+
+  state = g_hash_table_lookup (self->blur_states, ctx->output);
+  if (!state || !state->cache_filled[source])
+    return 0;
+
+  return state->cache[source];
+}
+
+
+/**
+ * phoc_renderer_blur_wants_whole_frame:
+ * @self: The renderer
+ * @output: The output about to be drawn
+ * @radius: The largest blur radius asked for on it
+ *
+ * Whether the next frame on @output has to repaint all of it for the blur's
+ * sake. It only does when a cache it is about to draw from is stale, which is once per wallpaper change rather
+ * than once per frame.
+ *
+ * Returns: %TRUE to promote the frame's damage to the whole output
+ */
+gboolean
+phoc_renderer_blur_wants_whole_frame (PhocRenderer *self, PhocOutput *output, guint radius)
+{
+  PhocBlurState *state;
+
+  g_assert (PHOC_IS_RENDERER (self));
+
+  if (radius == 0)
+    return FALSE;
+
+  /* A blur that cannot be drawn must not cost a full repaint per frame */
+  if (self->blur_prog_failed || self->blur_state_failed)
+    return FALSE;
+
+  state = g_hash_table_lookup (self->blur_states, output);
+  if (!state)
+    return TRUE;
+
+  if (state->width != output->wlr_output->width || state->height != output->wlr_output->height)
+    return TRUE;
+
+  /* Under a fullscreen app the wallpaper is not drawn, so it cannot be
+   * captured either; the last cache stands in until it is. */
+  if (output->fullscreen_view == NULL &&
+      !blur_cache_current (state, output, PHOC_BLUR_SOURCE_WALLPAPER, radius))
+    return TRUE;
+
+  if (blur_overlay_source_needed (output) &&
+      !blur_cache_current (state, output, PHOC_BLUR_SOURCE_OVERLAY, radius))
+    return TRUE;
+
+  return FALSE;
+}
+
+
+static void
+blur_state_mark_dirty (PhocBlurState *state, gboolean wallpaper, gboolean overlay)
+{
+  if (wallpaper)
+    state->cache_dirty[PHOC_BLUR_SOURCE_WALLPAPER] = TRUE;
+  if (overlay)
+    state->cache_dirty[PHOC_BLUR_SOURCE_OVERLAY] = TRUE;
+}
+
+
+static void
+blur_mark_all_dirty (PhocRenderer *self)
+{
+  GHashTableIter iter;
+  gpointer state;
+
+  if (self->blur_states == NULL)
+    return;
+
+  g_hash_table_iter_init (&iter, self->blur_states);
+  while (g_hash_table_iter_next (&iter, NULL, &state))
+    blur_state_mark_dirty (state, TRUE, TRUE);
+}
+
+
+/**
+ * phoc_renderer_blur_source_changed:
+ * @self: The renderer
+ * @output: The output @layer_surface is on
+ * @layer_surface: A layer surface that committed, mapped or unmapped
+ * @everything: Whether to drop every cache regardless, e.g. on a layer change
+ *
+ * Mark the cached backdrops that @layer_surface is part of as stale. That is
+ * how the cached blur follows the wallpaper: only a change to a backdrop's own
+ * source triggers a recapture, so apps, the panel and the lock screen keypad
+ * can redraw as often as they like without one.
+ */
+void
+phoc_renderer_blur_source_changed (PhocRenderer     *self,
+                                   PhocOutput       *output,
+                                   PhocLayerSurface *layer_surface,
+                                   gboolean          everything)
+{
+  PhocBlurState *state;
+  enum zwlr_layer_shell_v1_layer layer;
+
+  g_assert (PHOC_IS_RENDERER (self));
+
+  if (self->blur_states == NULL || output == NULL)
+    return;
+
+  state = g_hash_table_lookup (self->blur_states, output);
+  if (!state)
+    return;
+
+  layer = phoc_layer_surface_get_layer (layer_surface);
+
+  if (everything || layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND)
+    blur_state_mark_dirty (state, TRUE, TRUE);
+  else if (layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY &&
+           phoc_layer_surface_get_blur (layer_surface) == 0)
+    blur_state_mark_dirty (state, FALSE, TRUE);
 }
 
 
@@ -1445,8 +1705,7 @@ phoc_renderer_render_output (PhocRenderer *self, PhocOutput *output, PhocRenderC
   g_assert (PHOC_IS_RENDERER (self));
 
   ctx->renderer = self;
-  ctx->blur_texture = 0;
-  ctx->blur_stale = FALSE;
+  ctx->buffer_damage = NULL;
 
   pixman_region32_init (&transformed_damage);
 
@@ -1458,6 +1717,7 @@ phoc_renderer_render_output (PhocRenderer *self, PhocOutput *output, PhocRenderC
   pixman_region32_copy (&transformed_damage, damage);
   phoc_output_transform_damage (output, &transformed_damage);
   wlr_output_handle_damage(wlr_output, &transformed_damage);
+  ctx->buffer_damage = &transformed_damage;
 
   wlr_render_pass_add_rect (ctx->render_pass,
                             &(struct wlr_render_rect_options){
@@ -1493,6 +1753,9 @@ phoc_renderer_render_output (PhocRenderer *self, PhocOutput *output, PhocRenderC
   } else {
     // Render background and bottom layers under views
     render_layer (ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ctx);
+    /* The wallpaper is complete here and nothing else is drawn yet, so this
+     * is where its cached backdrop is taken, when it has gone stale */
+    blur_cache_refresh (ctx, PHOC_BLUR_SOURCE_WALLPAPER);
     render_layer (ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, ctx);
 
     /* Render all views */
@@ -1503,8 +1766,6 @@ phoc_renderer_render_output (PhocRenderer *self, PhocOutput *output, PhocRenderC
         render_view (output, view, ctx);
     }
     // Render top layer above views
-    // render_layer() captures the blur backdrop itself, just before each
-    // surface that asked for one
     render_layer (ZWLR_LAYER_SHELL_V1_LAYER_TOP, ctx);
   }
   render_drag_icons (phoc_server_get_input (server), ctx);
@@ -1512,6 +1773,7 @@ phoc_renderer_render_output (PhocRenderer *self, PhocOutput *output, PhocRenderC
   render_layer (ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, ctx);
 
  renderer_end:
+  ctx->buffer_damage = NULL;
   pixman_region32_fini (&transformed_damage);
   wlr_output_add_software_cursors_to_render_pass (wlr_output, ctx->render_pass, damage);
 

@@ -533,26 +533,26 @@ phoc_output_draw (PhocOutput *self)
    * A blurred backdrop is a pyramid over a copy of the whole scene below it,
    * and its coarse levels are a sixty-fourth of the output, so one of their
    * texels is sixty-four pixels wide: a blurred pixel is a weighted sum of
-   * content from hundreds of pixels away, recomputed over the whole capture
-   * every frame.
+   * content from hundreds of pixels away.
    *
-   * That is why any damage invalidates all of it, and why the whole output is
-   * repainted rather than the damage alone. Repainting only around the damage
-   * recomputes the pyramid from a capture whose other parts were taken at a
-   * different time -- the repainted patch then does not match what surrounds
-   * it -- and leaves the rest of the framebuffer holding the previous frame's
-   * composite, blurred surface included, which the pyramid would feed back
-   * into itself.
+   * So a backdrop can only ever be captured whole, in a frame that repaints
+   * the whole output. Repainting only around the damage recomputes the pyramid
+   * from a capture whose other parts were taken at a different time -- the
+   * repainted patch then does not match what surrounds it -- and leaves the
+   * rest of the framebuffer holding the previous frame's composite, blurred
+   * surface included, which the pyramid would feed back into itself.
    *
-   * The cost is real and it is bounded by asking first: with the blur
-   * gsetting off, or a renderer that cannot draw it, or nothing on the output
-   * asking for it, nothing is promoted. An idle screen damages nothing and so
-   * renders nothing at all.
+   * The cached blur captures only when the wallpaper (or what an overlay
+   * surface covers) changes, so only those frames are promoted; every other
+   * frame redraws just its damage, from the cache. Nothing is promoted with the
+   * blur gsetting off, a renderer that cannot draw it, or nothing on the
+   * output asking for it, and an idle screen renders nothing at all.
    */
   if (phoc_renderer_get_blur_enabled (priv->renderer))
     blur_radius = phoc_output_get_blur_radius (self);
 
-  if (blur_radius > 0 && pixman_region32_not_empty (&self->damage_ring.current))
+  if (blur_radius > 0 && pixman_region32_not_empty (&self->damage_ring.current) &&
+      phoc_renderer_blur_wants_whole_frame (priv->renderer, self, blur_radius))
     wlr_damage_ring_add_whole (&self->damage_ring);
 
   pending.committed |= WLR_OUTPUT_STATE_DAMAGE;
