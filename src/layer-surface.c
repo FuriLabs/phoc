@@ -101,6 +101,7 @@ handle_surface_commit (struct wl_listener *listener, void *data)
 
   if (wlr_output != NULL) {
     PhocOutput *output = PHOC_OUTPUT (wlr_output->data);
+    PhocRenderer *renderer = phoc_server_get_renderer (server);
     struct wlr_box old_geo = self->geo;
 
     bool layer_changed = false;
@@ -145,6 +146,10 @@ handle_surface_commit (struct wl_listener *listener, void *data)
     }
 
     phoc_output_set_layer_dirty (output, self->layer);
+
+    /* The cached blur is redrawn when its source commits, so this is what
+     * makes it follow a wallpaper change */
+    phoc_renderer_blur_source_changed (renderer, output, self, layer_changed);
   }
 }
 
@@ -212,6 +217,8 @@ handle_map (struct wl_listener *listener, void *data)
                                     wlr_layer_surface->surface,
                                     self->geo.x,
                                     self->geo.y);
+  phoc_renderer_blur_source_changed (phoc_server_get_renderer (phoc_server_get_default ()),
+                                     output, self, FALSE);
 
   phoc_utils_wlr_surface_enter_output (wlr_layer_surface->surface, output->wlr_output);
 
@@ -236,6 +243,9 @@ handle_unmap (struct wl_listener *listener, void *data)
   wl_list_remove (&self->new_subsurface.link);
 
   phoc_layer_surface_damage (self);
+  if (output)
+    phoc_renderer_blur_source_changed (phoc_server_get_renderer (phoc_server_get_default ()),
+                                       output, self, FALSE);
   phoc_input_update_cursor_focus (input);
 
   if (output)
