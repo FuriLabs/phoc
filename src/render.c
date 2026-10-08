@@ -40,6 +40,7 @@
 #include <wlr/types/wlr_matrix.h>
 #include <wlr/types/wlr_buffer.h>
 #include <wlr/types/wlr_linux_dmabuf_v1.h>
+#include <wlr/util/box.h>
 #include <wlr/util/region.h>
 #include <wlr/render/allocator.h>
 #include <GLES2/gl2.h>
@@ -79,10 +80,14 @@ static GParamSpec *props[PROP_LAST_PROP];
 #define PHOC_BLUR_MAX_LEVELS 5
 
 /* What a cached backdrop is a blurred picture of. The wallpaper is the
- * background layer; the overlay source is whatever an overlay surface sits
- * on, which for the lock screen is its own background surface. */
+ * background and bottom layers, which is what an application window sits on.
+ * The scene is everything below the top layer, applications included, which
+ * is what the drawer frosts while it is out. The overlay source is whatever an
+ * overlay surface sits on, which for the lock screen is its own background
+ * surface. */
 typedef enum {
   PHOC_BLUR_SOURCE_WALLPAPER,
+  PHOC_BLUR_SOURCE_SCENE,
   PHOC_BLUR_SOURCE_OVERLAY,
   PHOC_BLUR_N_SOURCES,
 } PhocBlurSource;
@@ -356,6 +361,8 @@ static void     phoc_renderer_capture_blur (PhocRenderer      *self,
 static GLuint   blur_backdrop_get          (PhocRenderContext *ctx,
                                             PhocBlurSource     source);
 static void     blur_mark_all_dirty        (PhocRenderer      *self);
+static gboolean blur_wants_scene           (PhocOutput        *output,
+                                            PhocLayerSurface  *layer_surface);
 
 static void
 render_view (PhocOutput *output, PhocView *view, PhocRenderContext *ctx)
@@ -483,6 +490,8 @@ render_layer (enum zwlr_layer_shell_v1_layer layer, PhocRenderContext *ctx)
 
       if (layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY && covers_something)
         source = PHOC_BLUR_SOURCE_OVERLAY;
+      else if (layer == ZWLR_LAYER_SHELL_V1_LAYER_TOP && blur_wants_scene (ctx->output, layer_surface))
+        source = PHOC_BLUR_SOURCE_SCENE;
 
       render_blur_backdrop (layer_surface, blur_backdrop_get (ctx, source), ctx);
     } else if (layer_surface->mapped) {
@@ -1474,6 +1483,54 @@ blur_overlay_source_needed (PhocOutput *output)
 
 
 /*
+ * Whether a blurred top layer surface frosts the scene rather than the
+ * wallpaper: when enough of it is on screen over the area applications use.
+ *
+ * The folded panel is the case this tells apart. It is a full screen surface
+ * pushed up so only its bar shows, and the bar sits in its own exclusive zone,
+ * where no application ever draws -- so there it frosts the wallpaper, and an
+ * application redrawing below it costs nothing. Pulled down, the drawer covers
+ * the application, and frosts that. The threshold keeps a bar that overhangs
+ * its zone by a shadow's width from counting as pulled.
+ */
+#define PHOC_BLUR_SCENE_MIN_OVERLAP 16
+
+static gboolean
+blur_wants_scene (PhocOutput *output, PhocLayerSurface *layer_surface)
+{
+  struct wlr_box out = { 0 }, on_screen, over;
+
+  wlr_output_effective_resolution (output->wlr_output, &out.width, &out.height);
+  if (!wlr_box_intersection (&on_screen, &layer_surface->geo, &out))
+    return FALSE;
+
+  if (!wlr_box_intersection (&over, &on_screen, &output->usable_area))
+    return FALSE;
+
+  return over.height >= PHOC_BLUR_SCENE_MIN_OVERLAP && over.width >= PHOC_BLUR_SCENE_MIN_OVERLAP;
+}
+
+
+/* Whether any blurred top layer surface draws from the scene cache */
+static gboolean
+blur_scene_source_needed (PhocOutput *output)
+{
+  GQueue *layer_surfaces = phoc_output_get_layer_surfaces_for_layer (output,
+                                                                     ZWLR_LAYER_SHELL_V1_LAYER_TOP);
+
+  for (GList *l = layer_surfaces->head; l; l = l->next) {
+    PhocLayerSurface *layer_surface = PHOC_LAYER_SURFACE (l->data);
+
+    if (layer_surface->mapped && phoc_layer_surface_get_blur (layer_surface) > 0 &&
+        blur_wants_scene (output, layer_surface))
+      return TRUE;
+  }
+
+  return FALSE;
+}
+
+
+/*
  * A cache may only be captured in a frame that repaints the whole output:
  * anywhere outside the damage the framebuffer still holds last frame's
  * composite, blurred surfaces included. The output promotes its damage to
@@ -1522,10 +1579,10 @@ blur_backdrop_get (PhocRenderContext *ctx, PhocBlurSource source)
   PhocRenderer *self = ctx->renderer;
   PhocBlurState *state;
 
-  /* The wallpaper is captured once its layer is drawn, in
-   * phoc_renderer_render_output(). The overlay source can only be captured
-   * here, at the point in the overlay layer where it is complete. */
-  if (source == PHOC_BLUR_SOURCE_OVERLAY)
+  /* The wallpaper is captured once its layers are drawn, in
+   * phoc_renderer_render_output(). The scene and overlay sources can only be
+   * captured here, at the point in their layer where they are complete. */
+  if (source != PHOC_BLUR_SOURCE_WALLPAPER)
     blur_cache_refresh (ctx, source);
 
   state = g_hash_table_lookup (self->blur_states, ctx->output);
@@ -1579,15 +1636,21 @@ phoc_renderer_blur_wants_whole_frame (PhocRenderer *self, PhocOutput *output, gu
       !blur_cache_current (state, output, PHOC_BLUR_SOURCE_OVERLAY, radius))
     return TRUE;
 
+  if (blur_scene_source_needed (output) &&
+      !blur_cache_current (state, output, PHOC_BLUR_SOURCE_SCENE, radius))
+    return TRUE;
+
   return FALSE;
 }
 
 
 static void
-blur_state_mark_dirty (PhocBlurState *state, gboolean wallpaper, gboolean overlay)
+blur_state_mark_dirty (PhocBlurState *state, gboolean wallpaper, gboolean scene, gboolean overlay)
 {
   if (wallpaper)
     state->cache_dirty[PHOC_BLUR_SOURCE_WALLPAPER] = TRUE;
+  if (scene)
+    state->cache_dirty[PHOC_BLUR_SOURCE_SCENE] = TRUE;
   if (overlay)
     state->cache_dirty[PHOC_BLUR_SOURCE_OVERLAY] = TRUE;
 }
@@ -1604,7 +1667,7 @@ blur_mark_all_dirty (PhocRenderer *self)
 
   g_hash_table_iter_init (&iter, self->blur_states);
   while (g_hash_table_iter_next (&iter, NULL, &state))
-    blur_state_mark_dirty (state, TRUE, TRUE);
+    blur_state_mark_dirty (state, TRUE, TRUE, TRUE);
 }
 
 
@@ -1640,11 +1703,50 @@ phoc_renderer_blur_source_changed (PhocRenderer     *self,
 
   layer = phoc_layer_surface_get_layer (layer_surface);
 
-  if (everything || layer == ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND)
-    blur_state_mark_dirty (state, TRUE, TRUE);
-  else if (layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY &&
-           phoc_layer_surface_get_blur (layer_surface) == 0)
-    blur_state_mark_dirty (state, FALSE, TRUE);
+  /* A blurred surface is never part of its own source */
+  if (!everything && phoc_layer_surface_get_blur (layer_surface) > 0)
+    return;
+
+  switch (layer) {
+  case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+  case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+    blur_state_mark_dirty (state, TRUE, TRUE, TRUE);
+    break;
+  case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+    blur_state_mark_dirty (state, everything, TRUE, everything);
+    break;
+  case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+    blur_state_mark_dirty (state, everything, everything, TRUE);
+    break;
+  default:
+    blur_state_mark_dirty (state, TRUE, TRUE, TRUE);
+    break;
+  }
+}
+
+
+/**
+ * phoc_renderer_blur_scene_changed:
+ * @self: The renderer
+ * @output: The output an application window changed on
+ *
+ * Mark the scene cache stale after an application window committed, mapped,
+ * unmapped or moved. Only the drawer draws from it, and only while it is out,
+ * so this costs nothing until then.
+ */
+void
+phoc_renderer_blur_scene_changed (PhocRenderer *self, PhocOutput *output)
+{
+  PhocBlurState *state;
+
+  g_assert (PHOC_IS_RENDERER (self));
+
+  if (self->blur_states == NULL)
+    return;
+
+  state = g_hash_table_lookup (self->blur_states, output);
+  if (state)
+    blur_state_mark_dirty (state, FALSE, TRUE, FALSE);
 }
 
 
@@ -1753,10 +1855,11 @@ phoc_renderer_render_output (PhocRenderer *self, PhocOutput *output, PhocRenderC
   } else {
     // Render background and bottom layers under views
     render_layer (ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, ctx);
-    /* The wallpaper is complete here and nothing else is drawn yet, so this
-     * is where its cached backdrop is taken, when it has gone stale */
-    blur_cache_refresh (ctx, PHOC_BLUR_SOURCE_WALLPAPER);
     render_layer (ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM, ctx);
+    /* Everything an application window sits on is drawn here and nothing
+     * else is yet, so this is where the wallpaper cache is taken, when it has
+     * gone stale */
+    blur_cache_refresh (ctx, PHOC_BLUR_SOURCE_WALLPAPER);
 
     /* Render all views */
     for (GList *l = phoc_desktop_get_views (desktop)->tail; l; l = l->prev) {

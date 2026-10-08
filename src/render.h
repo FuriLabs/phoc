@@ -51,6 +51,8 @@ void          phoc_renderer_set_blur_enabled      (PhocRenderer           *self,
 gboolean      phoc_renderer_blur_wants_whole_frame (PhocRenderer          *self,
                                                     PhocOutput            *output,
                                                     guint                  radius);
+void          phoc_renderer_blur_scene_changed    (PhocRenderer           *self,
+                                                   PhocOutput             *output);
 void          phoc_renderer_blur_source_changed   (PhocRenderer           *self,
                                                    PhocOutput             *output,
                                                    PhocLayerSurface       *layer_surface,

@@ -1663,6 +1663,9 @@ phoc_output_damage_from_view (PhocOutput *self, PhocView  *view, bool whole)
     return;
   }
 
+  /* Whatever an application window does changes what the drawer frosts */
+  phoc_renderer_blur_scene_changed (phoc_server_get_renderer (phoc_server_get_default ()), self);
+
   if (whole)
     damage_whole_view (self, view);
 
